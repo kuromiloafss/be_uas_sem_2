@@ -1,2 +1,4 @@
 *
 !.gitignore
+!barang/
+!bukti_klaim/

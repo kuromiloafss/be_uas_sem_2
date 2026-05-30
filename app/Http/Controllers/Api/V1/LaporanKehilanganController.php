@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Barang;
 use App\Models\LaporanKehilangan;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 
 class LaporanKehilanganController extends Controller
@@ -82,5 +83,66 @@ class LaporanKehilanganController extends Controller
             'success' => true,
             'data' => $reports
         ]);
+    }
+
+    /**
+     * Mark a loss report as self-resolved by the owner
+     * (e.g. "I found it myself" / "Ketemu Sendiri").
+     * Only the report owner can call this.
+     */
+    public function markAsFound(Request $request, $id)
+    {
+        $laporan = LaporanKehilangan::with('barang')->find($id);
+
+        if (!$laporan) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Laporan tidak ditemukan'
+            ], 404);
+        }
+
+        // Ownership check: only the reporter can cancel their own report
+        if ($laporan->user_id !== Auth::id()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Anda bukan pemilik laporan ini.'
+            ], 403);
+        }
+
+        // Prevent cancelling an already-resolved report
+        if ($laporan->status_laporan === 'dibatalkan' || $laporan->status_laporan === 'selesai') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Laporan ini sudah diselesaikan atau dibatalkan.'
+            ], 400);
+        }
+
+        try {
+            DB::beginTransaction();
+
+            // Update laporan status
+            $laporan->status_laporan = 'dibatalkan';
+            $laporan->save();
+
+            // Update parent barang status
+            if ($laporan->barang) {
+                $laporan->barang->status = 'dibatalkan';
+                $laporan->barang->save();
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Laporan berhasil dibatalkan. Semoga barang Anda sudah ketemu!'
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Gagal membatalkan laporan: ' . $e->getMessage()
+            ], 500);
+        }
     }
 }

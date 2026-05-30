@@ -14,10 +14,21 @@ class AdminController extends Controller
 {
     public function dashboardStats()
     {
-        $totalFound = BarangTemuan::count();
-        $totalLost = LaporanKehilangan::count();
+        // total_lost counts LaporanKehilangan records whose associated barang status is 'belum_ditemukan'
+        $totalLost = LaporanKehilangan::whereHas('barang', function ($query) {
+            $query->where('status', 'belum_ditemukan');
+        })->count();
+
+        // total_found counts BarangTemuan records whose associated barang status is not archived ('arsip' or 'diarsipkan')
+        $totalFound = BarangTemuan::whereHas('barang', function ($query) {
+            $query->whereNotIn('status', ['arsip', 'diarsipkan']);
+        })->count();
+
         $pendingClaims = KlaimBarang::where('status', 'menunggu')->count();
-        $recentFound = BarangTemuan::with('barang')->orderBy('temuan_id', 'desc')->limit(5)->get();
+        
+        $recentFound = BarangTemuan::whereHas('barang', function ($query) {
+            $query->whereNotIn('status', ['arsip', 'diarsipkan']);
+        })->with('barang')->orderBy('temuan_id', 'desc')->limit(5)->get();
 
         return response()->json([
             'success' => true,
@@ -105,6 +116,7 @@ class AdminController extends Controller
     public function indexBarangHilang()
     {
         $barangs = Barang::has('laporan')
+            ->whereNotIn('status', ['diarsipkan', 'dikembalikan'])
             ->with(['kategori', 'laporan.gedung'])
             ->orderBy('barang_id', 'desc')
             ->get();
@@ -121,25 +133,71 @@ class AdminController extends Controller
             'status' => 'required|in:disetujui,ditolak',
         ]);
 
-        $klaim = KlaimBarang::with('temuan')->find($id);
-        if (!$klaim) return response()->json(['success' => false, 'message' => 'Klaim tidak ditemukan'], 404);
+        try {
+            DB::beginTransaction();
 
-        $klaim->status = $request->status;
-        $klaim->save();
-
-        // Jika disetujui, update status barang
-        if ($request->status === 'disetujui' && $klaim->temuan) {
-            $barang = Barang::find($klaim->temuan->barang_id);
-            if ($barang) {
-                $barang->status = 'diklaim';
-                $barang->save();
+            $klaim = KlaimBarang::with('temuan')->find($id);
+            if (!$klaim) {
+                DB::rollBack();
+                return response()->json(['success' => false, 'message' => 'Klaim tidak ditemukan'], 404);
             }
-        }
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Status klaim diperbarui'
-        ]);
+            // Guard: Prevent double-processing a claim that has already been actioned
+            if ($klaim->status !== 'menunggu') {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Klaim ini sudah diproses sebelumnya dan tidak dapat diubah lagi.'
+                ], 400);
+            }
+
+            $klaim->status = $request->status;
+            $klaim->save();
+
+            if ($request->status === 'disetujui' && $klaim->temuan) {
+                // On approval: mark barang and temuan as returned, create proof record
+                $barang = Barang::find($klaim->temuan->barang_id);
+                if ($barang) {
+                    $barang->status = 'dikembalikan';
+                    $barang->save();
+                }
+
+                $klaim->temuan->status = 'dikembalikan';
+                $klaim->temuan->save();
+
+                // Buat Bukti Pengembalian
+                $bukti = new \App\Models\BuktiPengembalian();
+                $bukti->klaim_id = $klaim->klaim_id;
+                $bukti->kode_pengambilan = 'PNM-' . str_pad($klaim->klaim_id, 4, '0', STR_PAD_LEFT);
+                $bukti->gedung_pengambilan_id = $klaim->temuan->gedung_ditemukan_id;
+                $bukti->save();
+
+            } elseif ($request->status === 'ditolak' && $klaim->temuan) {
+                // On rejection: revert barang and temuan status so the item is claimable again
+                $barang = Barang::find($klaim->temuan->barang_id);
+                if ($barang) {
+                    $barang->status = 'diunggah';
+                    $barang->save();
+                }
+
+                $klaim->temuan->status = 'diunggah';
+                $klaim->temuan->save();
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Status klaim diperbarui'
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Gagal memproses klaim: ' . $e->getMessage()
+            ], 500);
+        }
     }
 
     public function updateBarangStatus(Request $request, $id)
@@ -148,16 +206,66 @@ class AdminController extends Controller
             'status' => 'required|string'
         ]);
 
-        $barang = Barang::find($id);
+        $barang = Barang::with(['temuan', 'laporan'])->find($id);
         if (!$barang) return response()->json(['success' => false, 'message' => 'Barang tidak ditemukan'], 404);
 
-        $barang->status = $request->status;
-        $barang->save();
+        // Normalize alias statuses
+        $status = $request->status;
+        if ($status === 'arsip' || $status === 'diarsipkan') {
+            $status = 'diarsipkan';
+        }
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Status barang berhasil diperbarui'
-        ]);
+        try {
+            DB::beginTransaction();
+
+            $barang->status = $status;
+            $barang->save();
+
+            // Sync child BarangTemuan status to mirror parent barang status
+            if ($barang->temuan) {
+                if ($status === 'belum_ditemukan') {
+                    // Cascade-delete temuan and all associated claims/bukti when reverting to lost
+                    $temuan = $barang->temuan;
+                    $claims = KlaimBarang::where('temuan_id', $temuan->temuan_id)->get();
+                    foreach ($claims as $claim) {
+                        \App\Models\BuktiPengembalian::where('klaim_id', $claim->klaim_id)->delete();
+                        $claim->delete();
+                    }
+                    $temuan->delete();
+                } else {
+                    // For all other statuses (diarsipkan, dikembalikan, etc.): update status, preserve history
+                    $barang->temuan->status = $status;
+                    $barang->temuan->save();
+                }
+            }
+
+            // Sync child LaporanKehilangan status_laporan to mirror parent barang status
+            if ($barang->laporan) {
+                $laporanStatus = match($status) {
+                    'belum_ditemukan' => 'menunggu',
+                    'ditemukan'       => 'ditemukan',
+                    'dikembalikan'    => 'selesai',
+                    'diarsipkan'      => 'diarsipkan',
+                    default           => $barang->laporan->status_laporan,
+                };
+                $barang->laporan->status_laporan = $laporanStatus;
+                $barang->laporan->save();
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Status barang berhasil diperbarui'
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Gagal memperbarui status: ' . $e->getMessage()
+            ], 500);
+        }
     }
 
     public function convertLostToFound(Request $request, $id)
@@ -215,12 +323,35 @@ class AdminController extends Controller
         if (!$barang) return response()->json(['success' => false, 'message' => 'Barang tidak ditemukan'], 404);
 
         try {
+            DB::beginTransaction();
+
+            // 1. Clean up BarangTemuan and its descendants
+            $temuan = BarangTemuan::where('barang_id', $id)->first();
+            if ($temuan) {
+                // Find all claims associated with this temuan
+                $claims = KlaimBarang::where('temuan_id', $temuan->temuan_id)->get();
+                foreach ($claims as $claim) {
+                    // Delete associated BuktiPengembalian records first
+                    \App\Models\BuktiPengembalian::where('klaim_id', $claim->klaim_id)->delete();
+                    $claim->delete();
+                }
+                $temuan->delete();
+            }
+
+            // 2. Clean up LaporanKehilangan records
+            LaporanKehilangan::where('barang_id', $id)->delete();
+
+            // 3. Delete the Barang record
             $barang->delete();
+
+            DB::commit();
+
             return response()->json([
                 'success' => true,
                 'message' => 'Barang berhasil dihapus'
             ]);
         } catch (\Exception $e) {
+            DB::rollBack();
             return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
     }

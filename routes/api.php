@@ -29,13 +29,14 @@ Route::prefix('v1')->group(function () {
         // User Features
         Route::post('/laporan-kehilangan', [LaporanKehilanganController::class, 'store']);
         Route::get('/user/laporan', [LaporanKehilanganController::class, 'myReports']);
+        Route::put('/laporan-kehilangan/{id}/batalkan', [LaporanKehilanganController::class, 'markAsFound']);
         
         Route::post('/klaim', [KlaimController::class, 'store']);
         Route::get('/user/klaim', [KlaimController::class, 'myClaims']);
         Route::get('/klaim/{id}', [KlaimController::class, 'show']);
 
-        // Admin/Staff Features (Ideally with separate middleware, but role check can be inside)
-        Route::prefix('admin')->group(function () {
+        // Admin/Staff Features
+        Route::prefix('admin')->middleware('staff')->group(function () {
             Route::get('/dashboard-stats', [AdminController::class, 'dashboardStats']);
             Route::get('/barang-temuan', [AdminController::class, 'indexBarangTemuan']);
             Route::get('/barang-hilang', [AdminController::class, 'indexBarangHilang']);

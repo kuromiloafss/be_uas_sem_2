@@ -5,7 +5,9 @@ namespace App\Http\Controllers\Api\V1;
 use App\Http\Controllers\Controller;
 use App\Models\KlaimBarang;
 use App\Models\BarangTemuan;
+use App\Models\Barang;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class KlaimController extends Controller
 {
@@ -42,26 +44,52 @@ class KlaimController extends Controller
             ], 400);
         }
 
-        $klaim = new KlaimBarang();
-        $klaim->temuan_id = $request->temuan_id;
-        $klaim->user_id = auth()->id();
-        $klaim->tanggal_klaim = now();
-        $klaim->status = 'menunggu';
-        $klaim->verifikasi_kepemilikan = $request->verifikasi_kepemilikan;
-        $klaim->tempat_kehilangan = $request->tempat_kehilangan;
+        try {
+            DB::beginTransaction();
 
-        if ($request->hasFile('bukti_foto')) {
-            $path = $request->file('bukti_foto')->store('public/bukti_klaim');
-            $klaim->bukti_foto = basename($path);
+            $klaim = new KlaimBarang();
+            $klaim->temuan_id = $request->temuan_id;
+            $klaim->user_id = auth()->id();
+            $klaim->tanggal_klaim = now();
+            $klaim->status = 'menunggu';
+            $klaim->verifikasi_kepemilikan = $request->verifikasi_kepemilikan;
+            $klaim->tempat_kehilangan = $request->tempat_kehilangan;
+
+            if ($request->hasFile('bukti_foto')) {
+                $path = $request->file('bukti_foto')->store('public/bukti_klaim');
+                $klaim->bukti_foto = basename($path);
+            }
+
+            $klaim->save();
+
+            // Update associated barang_temuan and parent barang
+            $temuan = BarangTemuan::find($request->temuan_id);
+            if ($temuan) {
+                $temuan->status = 'diklaim';
+                $temuan->save();
+
+                $barang = Barang::find($temuan->barang_id);
+                if ($barang) {
+                    $barang->status = 'diklaim';
+                    $barang->save();
+                }
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Pengajuan klaim berhasil dikirim',
+                'data' => $klaim
+            ], 201);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Gagal mengajukan klaim: ' . $e->getMessage()
+            ], 500);
         }
-
-        $klaim->save();
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Pengajuan klaim berhasil dikirim',
-            'data' => $klaim
-        ], 201);
     }
 
     public function myClaims()
@@ -87,6 +115,14 @@ class KlaimController extends Controller
                 'success' => false,
                 'message' => 'Data klaim tidak ditemukan'
             ], 404);
+        }
+
+        // Security check: Only staff or the claim owner can access the claim detail
+        if (auth()->user()->role !== 'staff' && $klaim->user_id !== auth()->id()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. You cannot view this claim.'
+            ], 403);
         }
 
         return response()->json([
