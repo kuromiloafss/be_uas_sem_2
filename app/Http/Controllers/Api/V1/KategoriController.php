@@ -46,6 +46,15 @@ class KategoriController extends Controller
     {
         $kategori = KategoriBarang::find($id);
         if (!$kategori) return response()->json(['success' => false, 'message' => 'Not found'], 404);
+        
+        $hasBarang = \App\Models\Barang::withTrashed()->where('kategori_barang_id', $id)->exists();
+        if ($hasBarang) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Kategori tidak dapat dihapus karena masih digunakan oleh beberapa barang.'
+            ], 400);
+        }
+        
         $kategori->delete();
         return response()->json(['success' => true, 'message' => 'Deleted']);
     }
@@ -71,6 +80,18 @@ class KategoriController extends Controller
     {
         $gedung = Gedung::find($id);
         if (!$gedung) return response()->json(['success' => false, 'message' => 'Not found'], 404);
+        
+        $hasTemuan = \App\Models\BarangTemuan::withTrashed()->where('gedung_ditemukan_id', $id)->exists();
+        $hasBukti = \App\Models\BuktiPengembalian::where('gedung_pengambilan_id', $id)->exists();
+        $hasLaporan = \App\Models\LaporanKehilangan::withTrashed()->where('gedung_id', $id)->exists();
+        
+        if ($hasTemuan || $hasBukti || $hasLaporan) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Gedung tidak dapat dihapus karena masih digunakan dalam riwayat/laporan barang.'
+            ], 400);
+        }
+        
         $gedung->delete();
         return response()->json(['success' => true, 'message' => 'Deleted']);
     }

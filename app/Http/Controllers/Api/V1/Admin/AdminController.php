@@ -115,8 +115,12 @@ class AdminController extends Controller
 
     public function indexBarangHilang()
     {
+        // Show all barang with a laporan EXCEPT those that are fully resolved:
+        // - 'dikembalikan' = barang sudah diserahkan ke pemilik, tidak perlu tampil lagi
+        // - 'dibatalkan'   = laporan dibatalkan oleh user sendiri
+        // - 'diarsipkan' IS intentionally kept visible so staff can see archived records
         $barangs = Barang::has('laporan')
-            ->whereNotIn('status', ['diarsipkan', 'dikembalikan'])
+            ->whereNotIn('status', ['dikembalikan', 'dibatalkan'])
             ->with(['kategori', 'laporan.gedung'])
             ->orderBy('barang_id', 'desc')
             ->get();
@@ -155,22 +159,22 @@ class AdminController extends Controller
             $klaim->save();
 
             if ($request->status === 'disetujui' && $klaim->temuan) {
-                // On approval: mark barang and temuan as returned, create proof record
+                // On approval: mark barang and temuan as 'diklaim'.
+                // 'dikembalikan' will only be set later when staff manually confirms handover.
                 $barang = Barang::find($klaim->temuan->barang_id);
                 if ($barang) {
-                    $barang->status = 'dikembalikan';
+                    $barang->status = 'diklaim';
                     $barang->save();
+
+                    // Sync laporan kehilangan status if exists
+                    if ($barang->laporan) {
+                        $barang->laporan->status_laporan = 'diklaim';
+                        $barang->laporan->save();
+                    }
                 }
 
-                $klaim->temuan->status = 'dikembalikan';
+                $klaim->temuan->status = 'diklaim';
                 $klaim->temuan->save();
-
-                // Buat Bukti Pengembalian
-                $bukti = new \App\Models\BuktiPengembalian();
-                $bukti->klaim_id = $klaim->klaim_id;
-                $bukti->kode_pengambilan = 'PNM-' . str_pad($klaim->klaim_id, 4, '0', STR_PAD_LEFT);
-                $bukti->gedung_pengambilan_id = $klaim->temuan->gedung_ditemukan_id;
-                $bukti->save();
 
             } elseif ($request->status === 'ditolak' && $klaim->temuan) {
                 // On rejection: revert barang and temuan status so the item is claimable again
@@ -178,6 +182,12 @@ class AdminController extends Controller
                 if ($barang) {
                     $barang->status = 'diunggah';
                     $barang->save();
+
+                    // Sync laporan kehilangan status if exists
+                    if ($barang->laporan) {
+                        $barang->laporan->status_laporan = 'ditemukan';
+                        $barang->laporan->save();
+                    }
                 }
 
                 $klaim->temuan->status = 'diunggah';
@@ -243,13 +253,32 @@ class AdminController extends Controller
             if ($barang->laporan) {
                 $laporanStatus = match($status) {
                     'belum_ditemukan' => 'menunggu',
-                    'ditemukan'       => 'ditemukan',
+                    'diunggah'        => 'ditemukan',
+                    'diklaim'         => 'diklaim',
                     'dikembalikan'    => 'selesai',
                     'diarsipkan'      => 'diarsipkan',
                     default           => $barang->laporan->status_laporan,
                 };
                 $barang->laporan->status_laporan = $laporanStatus;
                 $barang->laporan->save();
+            }
+
+            // When staff manually marks as 'dikembalikan', create BuktiPengembalian
+            // if there is an approved claim that does not yet have a proof record
+            if ($status === 'dikembalikan' && $barang->temuan) {
+                $approvedKlaim = KlaimBarang::where('temuan_id', $barang->temuan->temuan_id)
+                    ->where('status', 'disetujui')
+                    ->first();
+                if ($approvedKlaim) {
+                    $alreadyExists = \App\Models\BuktiPengembalian::where('klaim_id', $approvedKlaim->klaim_id)->exists();
+                    if (!$alreadyExists) {
+                        $bukti = new \App\Models\BuktiPengembalian();
+                        $bukti->klaim_id = $approvedKlaim->klaim_id;
+                        $bukti->kode_pengambilan = 'PNM-' . str_pad($approvedKlaim->klaim_id, 4, '0', STR_PAD_LEFT);
+                        $bukti->gedung_pengambilan_id = $barang->temuan->gedung_ditemukan_id;
+                        $bukti->save();
+                    }
+                }
             }
 
             DB::commit();
@@ -319,30 +348,30 @@ class AdminController extends Controller
     }
     public function destroyBarang($id)
     {
-        $barang = Barang::find($id);
+        // withTrashed() agar bisa menemukan barang yang sudah soft-deleted sebelumnya
+        $barang = Barang::withTrashed()->find($id);
         if (!$barang) return response()->json(['success' => false, 'message' => 'Barang tidak ditemukan'], 404);
 
         try {
             DB::beginTransaction();
 
-            // 1. Clean up BarangTemuan and its descendants
-            $temuan = BarangTemuan::where('barang_id', $id)->first();
+            // 1. Clean up BarangTemuan and its descendants (including soft-deleted ones)
+            $temuan = BarangTemuan::withTrashed()->where('barang_id', $id)->first();
             if ($temuan) {
-                // Find all claims associated with this temuan
+                // Hard delete all BuktiPengembalian and KlaimBarang linked to this temuan
                 $claims = KlaimBarang::where('temuan_id', $temuan->temuan_id)->get();
                 foreach ($claims as $claim) {
-                    // Delete associated BuktiPengembalian records first
-                    \App\Models\BuktiPengembalian::where('klaim_id', $claim->klaim_id)->delete();
-                    $claim->delete();
+                    \App\Models\BuktiPengembalian::where('klaim_id', $claim->klaim_id)->delete(); // no SoftDeletes, already hard delete
+                    $claim->delete(); // no SoftDeletes, already hard delete
                 }
-                $temuan->delete();
+                $temuan->forceDelete(); // permanent delete
             }
 
-            // 2. Clean up LaporanKehilangan records
-            LaporanKehilangan::where('barang_id', $id)->delete();
+            // 2. Hard delete LaporanKehilangan records (including soft-deleted)
+            LaporanKehilangan::withTrashed()->where('barang_id', $id)->forceDelete();
 
-            // 3. Delete the Barang record
-            $barang->delete();
+            // 3. Hard delete the Barang record
+            $barang->forceDelete();
 
             DB::commit();
 
